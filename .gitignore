@@ -1,0 +1,26 @@
+# Secrets et chemins personnels
+.env
+
+# Environnements Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Modeles et donnees (trop lourds pour GitHub, limite 100 Mo par fichier)
+*.pt
+*.pth
+*.joblib
+*.jpg
+*.jpeg
+*.JPG
+*.png
+*.tif
+*.tiff
+resultats/
+crops/
+
+# Editeurs
+.vscode/
+.vs/
+.idea/
