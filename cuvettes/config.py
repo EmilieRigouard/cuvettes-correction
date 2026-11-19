@@ -54,8 +54,10 @@ SEUIL_RF = 0.5
 # --- Interface ---
 FENETRE_MAX_W = 1500
 FENETRE_MAX_H = 850
-RAYON_SECOURS = 60
-
+RAYON_DEFAUT = 20  
+ZOOM_MAX = 12.0     
+ZOOM_PAS = 1.25  
+   
 # --- Colonnes du CSV ---
 FEATURES = ["score", "largeur", "hauteur", "ratio", "contraste",
             "moy_int", "std_int"]

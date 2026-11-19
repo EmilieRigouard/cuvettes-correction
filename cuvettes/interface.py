@@ -1,6 +1,6 @@
 """Fenetre de correction : detection + suppression / ajout de cuvettes."""
 
-import statistics
+import math
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
@@ -8,8 +8,27 @@ import cv2
 from . import config
 from .detection import Detecteur
 from .donnees import Donnees, centre_rayon, lister_images
+from .vue import Vue
 
 FENETRE = "Correction"
+
+# Codes des fleches renvoyes par waitKeyEx (Windows)
+FLECHE_GAUCHE = 2424832
+FLECHE_HAUT = 2490368
+FLECHE_DROITE = 2555904
+FLECHE_BAS = 2621440
+PAS_FLECHE_PX = 150     # deplacement par appui (pixels ecran)
+SEUIL_MOLETTE = 120     # un cran de molette = 120 (les pads envoient
+#                         de plus petits increments, qu'on additionne)
+
+
+def delta_molette(flags):
+    """Sens de la molette : > 0 vers l'avant (zoom), < 0 vers l'arriere.
+    (cv2.getMouseWheelDelta n'existe pas dans toutes les versions)"""
+    d = (flags >> 16) & 0xFFFF
+    if d >= 0x8000:
+        d -= 0x10000
+    return d
 
 
 class Application:
@@ -24,12 +43,14 @@ class Application:
         self.i = 0
         self.nom = None
         self.img = None
-        self.echelle = 1.0
+        self.vue = None
         self.dirty = True
         self.historique = []
         self.drag = None
-        self.rayon = config.RAYON_SECOURS
-        self.rayon_manuel = False
+        self.pan = None
+        self.pos = (0, 0)
+        self.molette = 0
+        self.rayon = config.RAYON_DEFAUT
 
         print(len(self.noms), "images,",
               len(self.donnees.valides), "deja validees.")
@@ -55,7 +76,7 @@ class Application:
     # ----- navigation -----
     def charger(self, i):
         nom = self.noms[i]
-        dets = self.obtenir(nom)
+        self.obtenir(nom)
         if i + 1 < len(self.noms):
             self.demander(self.noms[i + 1])
         img = cv2.imread(str(config.DOSSIER_IMAGES / nom))
@@ -65,15 +86,14 @@ class Application:
         self.i = i
         self.nom = nom
         self.img = img
-        self.echelle = min(config.FENETRE_MAX_W / w,
-                           config.FENETRE_MAX_H / h, 1.0)
+        self.vue = Vue(w, h, config.FENETRE_MAX_W, config.FENETRE_MAX_H,
+                       config.ZOOM_MAX, config.ZOOM_PAS)
+        self.pos = (self.vue.vw // 2, self.vue.vh // 2)
         self.historique = []
         self.drag = None
+        self.pan = None
+        self.molette = 0
         self.dirty = True
-        if not self.rayon_manuel:
-            r = [centre_rayon(l)[2] for l in dets if l["garde_manuel"]]
-            if r:
-                self.rayon = int(statistics.median(r))
 
     def premiere_non_validee(self):
         for k, nom in enumerate(self.noms):
@@ -84,6 +104,7 @@ class Application:
 
     # ----- edition -----
     def ajouter_cuvette(self, cx, cy, r):
+        """cx, cy, r en coordonnees IMAGE."""
         h, w = self.img.shape[:2]
         r = max(int(r), 3)
         l = {c: "" for c in config.COLONNES}
@@ -111,78 +132,122 @@ class Application:
             self.donnees.data[self.nom].remove(l)
         self.dirty = True
 
+    def basculer(self, x, y):
+        """Supprime / remet la cuvette sous le point ecran (x, y)."""
+        v = self.vue
+        s = v.echelle
+        X, Y = v.vers_image(x, y)
+        meilleur = None
+        meilleur_score = None
+        for l in self.donnees.data[self.nom]:
+            cx, cy, r = centre_rayon(l)
+            d = ((X - cx) ** 2 + (Y - cy) ** 2) ** 0.5
+            tol = max(r, 20 / s)
+            if d <= tol:
+                score = d / tol
+                if meilleur is None or score < meilleur_score:
+                    meilleur = l
+                    meilleur_score = score
+        if meilleur is not None:
+            meilleur["garde_manuel"] = 1 - meilleur["garde_manuel"]
+            self.historique.append(("toggle", meilleur))
+            self.dirty = True
+
+    def terminer_ajout(self, x, y):
+        """Fin du clic / glisser : cree la cuvette."""
+        v = self.vue
+        x0, y0, _, _ = self.drag
+        dist = math.hypot(x - x0, y - y0)
+        self.drag = None
+        r = self.rayon if dist < 8 else dist / v.echelle
+        cx, cy = v.vers_image(x0, y0)
+        self.ajouter_cuvette(cx, cy, r)
+
     # ----- affichage -----
     def dessiner(self):
-        s = self.echelle
-        vue = cv2.resize(self.img, None, fx=s, fy=s,
-                         interpolation=cv2.INTER_AREA)
+        v = self.vue
+        s = v.echelle
+        vue = v.rendre(self.img)
         dets = self.donnees.data[self.nom]
         for l in dets:
             cx, cy, r = centre_rayon(l)
-            cx = int(cx * s)
-            cy = int(cy * s)
-            r = max(int(r * s), 3)
+            ex, ey = v.vers_ecran(cx, cy)
+            ex = int(ex)
+            ey = int(ey)
+            re = max(int(r * s), 3)
+            if ex < -re or ex > v.vw + re or ey < -re or ey > v.vh + re:
+                continue
             if l["garde_manuel"] and l["ajout_manuel"]:
-                cv2.circle(vue, (cx, cy), r, (0, 200, 0), 3)
+                cv2.circle(vue, (ex, ey), re, (0, 200, 0), 3)
             elif l["garde_manuel"]:
-                cv2.circle(vue, (cx, cy), r, (0, 0, 255), 3)
+                cv2.circle(vue, (ex, ey), re, (0, 0, 255), 3)
             else:
-                cv2.circle(vue, (cx, cy), r, (0, 165, 255), 1)
+                cv2.circle(vue, (ex, ey), re, (0, 165, 255), 1)
         if self.drag:
             x0, y0, x1, y1 = self.drag
-            rr = int(((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5)
+            rr = int(math.hypot(x1 - x0, y1 - y0))
             cv2.circle(vue, (x0, y0), max(rr, 3), (255, 255, 0), 2)
 
         nb = sum(l["garde_manuel"] for l in dets)
-        t1 = "[%d/%d] %s - %d cuvettes" % (
-            self.i + 1, len(self.noms), self.nom, nb)
-        t2 = "clic G=supprimer  clic D=ajouter (taille %d, +/-)" % self.rayon
-        t3 = "d=valider+suivant a=precedent z=annuler q=quitter"
-        cv2.rectangle(vue, (0, 0), (vue.shape[1], 50), (0, 0, 0), -1)
+        t1 = "[%d/%d] %s - %d cuvettes - zoom x%.1f" % (
+            self.i + 1, len(self.noms), self.nom, nb, v.zoom)
+        t2 = "clic G=supprimer  clic D=ajouter (rayon %d, +/-)" % self.rayon
+        t3 = ("d=valider a=precedent z=annuler q=quitter | "
+              "2 doigts/molette ou e/r=zoom  0=vue entiere  "
+              "fleches ou Maj+glisser=deplacer")
+        cv2.rectangle(vue, (0, 0), (vue.shape[1], 70), (0, 0, 0), -1)
         font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(vue, t1 + "   " + t3, (8, 18), font, 0.5,
-                    (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(vue, t2, (8, 40), font, 0.5,
-                    (255, 255, 255), 1, cv2.LINE_AA)
+        for k, texte in enumerate((t1, t2, t3)):
+            cv2.putText(vue, texte, (8, 18 + 22 * k), font, 0.5,
+                        (255, 255, 255), 1, cv2.LINE_AA)
         return vue
 
     def souris(self, event, x, y, flags, param):
-        s = self.echelle
+        v = self.vue
+
+        # molette ou 2 doigts sur le pad : zoom centre sur le curseur
+        if event == cv2.EVENT_MOUSEWHEEL:
+            self.molette += delta_molette(flags)
+            sx, sy = self.pos
+            while self.molette >= SEUIL_MOLETTE:
+                v.zoomer(config.ZOOM_PAS, sx, sy)
+                self.molette -= SEUIL_MOLETTE
+            while self.molette <= -SEUIL_MOLETTE:
+                v.zoomer(1.0 / config.ZOOM_PAS, sx, sy)
+                self.molette += SEUIL_MOLETTE
+            self.dirty = True
+            return
+
+        self.pos = (x, y)
+
+        if event == cv2.EVENT_MOUSEMOVE:
+            if self.pan:
+                if flags & cv2.EVENT_FLAG_LBUTTON:
+                    px, py = self.pan
+                    v.deplacer(px - x, py - y)
+                    self.pan = (x, y)
+                    self.dirty = True
+                else:
+                    self.pan = None
+            if self.drag:
+                x0, y0, _, _ = self.drag
+                self.drag = (x0, y0, x, y)
+                self.dirty = True
+            return
 
         if event == cv2.EVENT_LBUTTONDOWN:
-            X = x / s
-            Y = y / s
-            meilleur = None
-            meilleur_score = None
-            for l in self.donnees.data[self.nom]:
-                cx, cy, r = centre_rayon(l)
-                d = ((X - cx) ** 2 + (Y - cy) ** 2) ** 0.5
-                tol = max(r, 20 / s)
-                if d <= tol:
-                    score = d / tol
-                    if meilleur is None or score < meilleur_score:
-                        meilleur = l
-                        meilleur_score = score
-            if meilleur is not None:
-                meilleur["garde_manuel"] = 1 - meilleur["garde_manuel"]
-                self.historique.append(("toggle", meilleur))
-                self.dirty = True
-
+            if flags & cv2.EVENT_FLAG_SHIFTKEY:
+                self.pan = (x, y)                  # Maj + glisser
+            else:
+                self.basculer(x, y)                # clic gauche
+        elif event == cv2.EVENT_LBUTTONUP:
+            self.pan = None
         elif event == cv2.EVENT_RBUTTONDOWN:
             self.drag = (x, y, x, y)
             self.dirty = True
-
-        elif event == cv2.EVENT_MOUSEMOVE and self.drag:
-            x0, y0, _, _ = self.drag
-            self.drag = (x0, y0, x, y)
-            self.dirty = True
-
-        elif event == cv2.EVENT_RBUTTONUP and self.drag:
-            x0, y0, _, _ = self.drag
-            dist = ((x - x0) ** 2 + (y - y0) ** 2) ** 0.5
-            self.drag = None
-            r = self.rayon if dist < 8 else dist / s
-            self.ajouter_cuvette(x0 / s, y0 / s, r)
+        elif event == cv2.EVENT_RBUTTONUP:
+            if self.drag:
+                self.terminer_ajout(x, y)
 
     # ----- boucle principale -----
     def lancer(self):
@@ -195,28 +260,48 @@ class Application:
                 cv2.imshow(FENETRE, self.dessiner())
                 self.dirty = False
 
-            k = cv2.waitKey(30) & 0xFF
+            k = cv2.waitKeyEx(30)
+            kb = (k & 0xFF) if k != -1 else -1
 
-            if k in (ord("d"), 32, 13):
+            if kb in (ord("d"), 32, 13):
                 self.donnees.valider(self.nom)
                 if self.i == len(self.noms) - 1:
                     print("Derniere image atteinte.")
                     break
                 self.charger(self.i + 1)
-            elif k == ord("a") and self.i > 0:
+            elif kb == ord("a") and self.i > 0:
                 self.donnees.valider(self.nom)
                 self.charger(self.i - 1)
-            elif k == ord("z"):
+            elif kb == ord("z"):
                 self.annuler()
-            elif k in (ord("+"), ord("=")):
+            elif kb in (ord("+"), ord("=")):
                 self.rayon = int(self.rayon * 1.1) + 1
-                self.rayon_manuel = True
                 self.dirty = True
-            elif k in (ord("-"), ord("_")):
+            elif kb in (ord("-"), ord("_")):
                 self.rayon = max(5, int(self.rayon / 1.1))
-                self.rayon_manuel = True
                 self.dirty = True
-            elif k in (ord("q"), 27):
+            elif kb == ord("e"):
+                self.vue.zoomer(config.ZOOM_PAS)
+                self.dirty = True
+            elif kb == ord("r"):
+                self.vue.zoomer(1.0 / config.ZOOM_PAS)
+                self.dirty = True
+            elif kb == ord("0"):
+                self.vue.reinitialiser()
+                self.dirty = True
+            elif k == FLECHE_GAUCHE:
+                self.vue.deplacer(-PAS_FLECHE_PX, 0)
+                self.dirty = True
+            elif k == FLECHE_DROITE:
+                self.vue.deplacer(PAS_FLECHE_PX, 0)
+                self.dirty = True
+            elif k == FLECHE_HAUT:
+                self.vue.deplacer(0, -PAS_FLECHE_PX)
+                self.dirty = True
+            elif k == FLECHE_BAS:
+                self.vue.deplacer(0, PAS_FLECHE_PX)
+                self.dirty = True
+            elif kb in (ord("q"), 27):
                 break
 
         self.donnees.sauver()
