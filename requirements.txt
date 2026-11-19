@@ -5,3 +5,8 @@ numpy
 python-dotenv
 scikit-learn
 joblib
+geopandas
+rasterio
+pyproj
+shapely
+affine
